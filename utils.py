@@ -1,163 +1,188 @@
 import pandas as pd
-import google.genai as genai
-import requests
 import os
+import requests
+import google.genai as genai
+import streamlit as st
 
-# ==================================================
-# CSV DATA HANDLING (UNCHANGED CORE MVP)
-# ==================================================
+# ===================== CSV ANALYSIS =====================
 
 def load_data(file):
-    """
-    Reads a CSV file into a Pandas DataFrame and validates the structure.
-    """
-    try:
-        df = pd.read_csv(file)
-        df.columns = df.columns.str.strip()
+    df = pd.read_csv(file)
+    df.columns = df.columns.str.strip()
 
-        required_columns = {"Date", "City", "AQI"}
-        if not required_columns.issubset(df.columns):
-            missing = required_columns - set(df.columns)
-            raise ValueError(
-                f"Missing required columns: {', '.join(missing)}"
-            )
+    required = {"Date", "City", "AQI"}
+    if not required.issubset(df.columns):
+        raise ValueError("CSV must contain Date, City, AQI columns")
 
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df["AQI"] = pd.to_numeric(df["AQI"], errors="coerce")
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["AQI"] = pd.to_numeric(df["AQI"], errors="coerce")
+    df = df.dropna(subset=["Date", "AQI"])
 
-        df = df.dropna(subset=["Date", "AQI"])
-        return df
-
-    except Exception as e:
-        raise ValueError(f"Error loading data: {str(e)}")
+    return df
 
 
 def summarize_data(df):
-    """
-    Generates a compact statistical summary for Gemini analysis.
-    """
-    start_date = df["Date"].min().strftime("%Y-%m-%d")
-    end_date = df["Date"].max().strftime("%Y-%m-%d")
-    cities = df["City"].unique().tolist()
+    lines = []
+    lines.append(f"Date Range: {df.Date.min().date()} to {df.Date.max().date()}")
+    lines.append(f"Cities: {', '.join(df.City.unique())}")
 
-    summary = [
-        "### DATASET SUMMARY",
-        f"Date Range: {start_date} to {end_date}",
-        f"Cities Included: {', '.join(cities)}",
-        "\n### CITY-WISE STATISTICS",
-    ]
-
-    for city in cities:
-        city_df = df[df["City"] == city]
-
-        summary.extend([
-            f"\nCity: {city}",
-            f"- Min AQI: {city_df['AQI'].min():.2f}",
-            f"- Max AQI: {city_df['AQI'].max():.2f}",
-            f"- Avg AQI: {city_df['AQI'].mean():.2f}",
-            "- Monthly Averages:"
-        ])
-
-        monthly = city_df.set_index("Date").resample("ME")["AQI"].mean()
-        for d, v in monthly.items():
-            if pd.notna(v):
-                summary.append(f"  {d.strftime('%Y-%m')}: {v:.1f}")
-
-    return "\n".join(summary)
-
-
-# ==================================================
-# GEMINI RESPONSE HANDLER (UPDATED SDK)
-# ==================================================
-
-def get_gemini_response(prompt, api_key):
-    """
-    Sends a prompt to Google Gemini and returns text response.
-    """
-    try:
-        if not api_key:
-            return "Error: Gemini API key missing."
-
-        client = genai.Client(api_key=api_key)
-
-        response = client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=prompt
+    for city in df.City.unique():
+        c = df[df.City == city]
+        lines.append(
+            f"{city} → Avg AQI {c.AQI.mean():.1f}, "
+            f"Min {c.AQI.min():.1f}, Max {c.AQI.max():.1f}"
         )
 
-        return response.text if response and response.text else "No response."
-
-    except Exception as e:
-        return f"Error connecting to Gemini: {str(e)}"
+    return "\n".join(lines)
 
 
-# ==================================================
-# OPENWEATHERMAP – LIVE AIR QUALITY
-# ==================================================
-
-def get_city_coordinates(city_name):
-    """
-    Converts city name to latitude & longitude using OpenWeather Geocoding API.
-    """
-    api_key = os.getenv("OPENWEATHER_API_KEY")
+def get_gemini_response(prompt):
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        return {"error": "OpenWeather API key not found."}
+        return "Gemini API key missing."
 
-    url = (
-        "https://api.openweathermap.org/geo/1.0/direct"
-        f"?q={city_name}&limit=1&appid={api_key}"
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=prompt
     )
+    return response.text if response and response.text else "No response from Gemini."
 
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
 
-        if not data:
-            return {"error": "City not found."}
+# ===================== LIVE AQI (OPENWEATHER) =====================
 
-        return {
-            "name": f"{data[0]['name']}, {data[0].get('country', '')}",
-            "lat": data[0]["lat"],
-            "lon": data[0]["lon"]
-        }
+def get_city_coordinates(city):
+    key = os.getenv("OPENWEATHER_API_KEY")
+    if not key:
+        return {"error": "OpenWeather API key missing"}
 
-    except requests.exceptions.RequestException:
-        return {"error": "Failed to fetch city coordinates."}
+    url = "https://api.openweathermap.org/geo/1.0/direct"
+    r = requests.get(url, params={"q": city, "limit": 1, "appid": key}, timeout=10)
+
+    if not r.json():
+        return {"error": "City not found"}
+
+    return {
+        "lat": r.json()[0]["lat"],
+        "lon": r.json()[0]["lon"]
+    }
 
 
 def fetch_air_pollution(lat, lon):
-    """
-    Fetches current and short-term air pollution data from OpenWeatherMap.
-    """
     api_key = os.getenv("OPENWEATHER_API_KEY")
     if not api_key:
-        return {"error": "OpenWeather API key not found."}
+        return {"error": "OpenWeather API key missing."}
 
-    current_url = (
-        "http://api.openweathermap.org/data/2.5/air_pollution"
-        f"?lat={lat}&lon={lon}&appid={api_key}"
-    )
-
-    forecast_url = (
-        "http://api.openweathermap.org/data/2.5/air_pollution/forecast"
-        f"?lat={lat}&lon={lon}&appid={api_key}"
-    )
+    url = "https://api.openweathermap.org/data/2.5/air_pollution"
+    params = {
+        "lat": lat,
+        "lon": lon,
+        "appid": api_key
+    }
 
     try:
-        current_resp = requests.get(current_url, timeout=10)
-        forecast_resp = requests.get(forecast_url, timeout=10)
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
 
-        current_resp.raise_for_status()
-        forecast_resp.raise_for_status()
-
-        current_data = current_resp.json()["list"][0]
-        forecast_data = forecast_resp.json()["list"][:3]
+        if "list" not in data or not data["list"]:
+            return {"error": "Air quality data unavailable from OpenWeather."}
 
         return {
-            "current": current_data,
-            "forecast": forecast_data
+            "current": data["list"][0],
+            "forecast": data["list"][:3]  # approx next 48 hrs
         }
 
+    except requests.exceptions.Timeout:
+        return {"error": "OpenWeather request timed out."}
     except requests.exceptions.RequestException:
+        return {"error": "Failed to connect to OpenWeather service."}
+
+
+def fetch_live_aqi(city_name):
+    """
+    Returns:
+    - current AQI
+    - AQI category
+    - pollutant components
+    - Next 24h and following 24h outlook (TEXT)
+    """
+
+    location = get_city_coordinates(city_name)
+    if "error" in location:
+        return {"error": "Failed to resolve city location."}
+
+    pollution = fetch_air_pollution(location["lat"], location["lon"])
+    if "error" in pollution:
         return {"error": "Failed to fetch air pollution data."}
+
+    if "current" not in pollution:
+        return {"error": "Air quality data unavailable at the moment."}
+
+    current = pollution["current"]
+    components = current.get("components", {})
+
+    aqi_value = current.get("main", {}).get("aqi")
+
+    aqi_category_map = {
+        1: "Good",
+        2: "Fair",
+        3: "Moderate",
+        4: "Poor",
+        5: "Very Poor"
+    }
+
+    category_now = aqi_category_map.get(aqi_value, "Unknown")
+
+    forecast_list = pollution.get("forecast", [])
+
+    # Default values
+    category_24h = category_now
+    category_48h = category_now
+
+    if len(forecast_list) >= 1:
+        category_24h = aqi_category_map.get(
+            forecast_list[0]["main"]["aqi"], category_now
+        )
+
+    if len(forecast_list) >= 2:
+        category_48h = aqi_category_map.get(
+            forecast_list[1]["main"]["aqi"], category_now
+        )
+
+    # ✅ EXACT FORMAT YOU WANT
+    forecast_text = (
+        f"Next 24 Hours: {category_24h}\n"
+        f"Following 24 Hours: {category_48h}"
+    )
+
+    return {
+        "aqi": aqi_value,
+        "category": category_now,
+        "components": components,
+        "forecast_text": forecast_text,
+        "next_2_days_trend": forecast_text,
+        "forecast": forecast_list
+    }
+
+
+# ===================== UI HELPERS =====================
+
+def display_components(components):
+    cols = st.columns(4)
+
+    pollutants = [
+        ("CO", components.get("co")),
+        ("NO", components.get("no")),
+        ("NO₂", components.get("no2")),
+        ("O₃", components.get("o3")),
+        ("SO₂", components.get("so2")),
+        ("PM2.5", components.get("pm2_5")),
+        ("PM10", components.get("pm10")),
+        ("NH₃", components.get("nh3")),
+    ]
+
+    for i, (name, value) in enumerate(pollutants):
+        with cols[i % 4]:
+            st.metric(name, f"{value}" if value is not None else "N/A")
+
