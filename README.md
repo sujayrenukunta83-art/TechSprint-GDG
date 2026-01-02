@@ -59,7 +59,6 @@ This project uses **Google Gemini** for:
 - Providing health-related insights
 - Generating qualitative forecasts without numeric speculation
 
-> ⚠️ AI-generated insights are interpretive and intended for **academic and research purposes only**.
 
 ---
 
@@ -113,6 +112,6 @@ Create a `.env` file (for local testing) or `.streamlit/secrets.toml` (for deplo
 GEMINI_API_KEY=your_gemini_api_key
 OPENWEATHER_API_KEY=your_openweather_api_key
 
-⚠️ Never commit API keys to GitHub.
+
 
 
